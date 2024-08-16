@@ -1,0 +1,277 @@
+#!/usr/bin/python3 -u
+"""
+Description: Game wrapper to set environment variables and enable things like
+gamescope and mangohud with one centralized configuration.
+Author: thnikk
+"""
+from subprocess import run, Popen, DEVNULL, STDOUT, CalledProcessError
+import signal
+import os
+import sys
+import argparse
+import json
+import glob
+import re
+import time
+
+
+def args_setup():
+    """ Set up argparse"""
+    # Set up argparse
+    parser = argparse.ArgumentParser(
+        prog='pygame',
+        description="""Game wrapper to set environment variables and enable
+        things like gamescope and mangohud with one centralized
+        configuration.""",
+        epilog='Config file is located at ~/.config/pygame.json'
+    )
+    parser.add_argument(
+        '-p', '--prime', action='store_true',
+        help='Enable PRIME offloading for NVIDIA gpus')
+    parser.add_argument(
+        '-g', '--gamescope', action='store_true', help='Enable gamescope')
+    parser.add_argument(
+        '-m', '--mangohud', action='store_true', help='Enable mangohud')
+    parser.add_argument(
+        '-M', '--gamemode', action='store_true', help='Enable gamemode')
+    parser.add_argument(
+        '-c', '--cursor', action='store_true',
+        help='Force grab cursor in gamescope')
+    parser.add_argument(
+        '-x', '--x11', action='store_true',
+        help='Force gamescope to run in x11 mode')
+    parser.add_argument(
+        '-o', '--opengl', action='store_true',
+        help='Specify that game uses OpenGL for mangohud')
+    parser.add_argument(
+        '-W', '--width', help='Output width override')
+    parser.add_argument(
+        '-H', '--height', help='Output height override')
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    return args
+
+
+def command_exists(command) -> bool:
+    """ Check if command exists """
+    try:
+        run(["which", command],
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+            check=True)
+        return True
+    except CalledProcessError:
+        print(f"{command} doesn't exist.")
+        return False
+
+
+def pkill(progs) -> None:
+    """ Kill list of programs """
+    for prog in progs:
+        run(['pkill', prog], check=False)
+
+
+def get_env(env_user) -> dict:
+    """ Get dictionary of environment variables """
+    env_os = os.environ.copy()
+    env_os.update(env_user)
+    return env_os
+
+
+def get_json_dict(path, default) -> dict:
+    """ Get dict from json file """
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            output = json.load(file, parse_int=str, parse_float=str)
+    except FileNotFoundError:
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(json.dumps(default, indent=4))
+        output = default
+    return output
+
+
+def get_device_path(vid_pid) -> str:
+    """ Get path to card """
+    def get_id(path) -> str:
+        """ Get ID from file """
+        with open(path, 'r', encoding='utf-8') as file:
+            return file.read().lstrip('0x').rstrip().lower()
+
+    for path in glob.glob('/sys/bus/pci/devices/*'):
+        try:
+            vendor = get_id(f'{path}/vendor')
+            product = get_id(f'{path}/device')
+            if f'{vendor}:{product}' == vid_pid.lower():
+                return f'''pci-{path.split("/")[-1].replace(
+                    ":", "_").replace(".", "_")}'''
+        except NotADirectoryError:
+            pass
+    raise ValueError('vid:pid not found.')
+
+
+def kill_siblings(process_name, parent_name) -> None:
+    """ Kill sibling processes """
+    print('Killing game process siblings.')
+
+    def get_output(command) -> list:
+        """ Get line split output of a command """
+        try:
+            output = run(
+                command, check=True, capture_output=True
+            ).stdout.decode('utf-8').strip().splitlines()
+            return output
+        except CalledProcessError:
+            return []
+
+    def get_command(pid) -> str:
+        """ Get full command for pid """
+        return get_output(['ps', '-p', pid, '-o', 'args', '--no-headers'])[0]
+
+    for line in get_output(['pgrep', process_name]):
+        try:
+            parents = get_output(['ps', '-o', 'ppid=', '-p', line])
+            for parent in parents:
+                if parent_name in get_command(parent):
+                    children = get_output(['pgrep', '-P', parent.strip()])
+                    for child in children:
+                        print('Killing', child)
+                        get_output(['kill', '-SIGKILL', child])
+        except CalledProcessError as e:
+            print(e.output)
+
+
+def get_tree(pid) -> list:
+    """ Get process tree of given PID """
+    output = run(
+        ['pstree', '-p', '-l', '-T', str(pid)],
+        check=False, capture_output=True
+    ).stdout.decode('utf-8')
+    tree = []
+    for line in output.splitlines():
+        tree = tree + re.findall(r'\(([^)]+)', line)
+    return list(reversed(tree[1:]))
+
+
+def kill(pid_list, sig="SIGTERM") -> None:
+    """ Kill process list with signal """
+    for pid in pid_list:
+        try:
+            run(['kill', f'-{sig}', pid], check=True, capture_output=False,
+                stdout=DEVNULL, stderr=STDOUT)
+            print(f'Sending {sig} to {pid}')
+        except (CalledProcessError, ValueError):
+            pass
+
+
+def cleanup(tree) -> None:
+    """ Kill leftover processes after game is closed """
+    kill(tree, 'SIGTERM')
+    time.sleep(3)
+    kill(tree, 'SIGKILL')
+
+
+def generate_command(args, steam, config_width, config_height):
+    """ Generate main command to run """
+    # Create command
+    command = []
+    if args.prime:
+        command = command + ["prime-run"]
+    if args.gamescope:
+        width = args.width or config_width
+        height = args.height or config_height
+        if command_exists('gamescope'):
+            gamescope = [
+                "gamescope",
+                "-w", width,
+                "-W", width,
+                "-h", height,
+                "-H", height,
+                "-f", "--"
+            ]
+            if steam:
+                gamescope.insert(-2, '-e')
+            if args.cursor:
+                gamescope.insert(-2, '--force-grab-cursor')
+            if args.x11:
+                gamescope.insert(-2, '--backend=sdl')
+            command = command + gamescope
+    if args.gamemode:
+        if command_exists('gamemoderun'):
+            command = command + ["gamemoderun"]
+    if args.mangohud and args.opengl:
+        if command_exists('mangohud'):
+            command = command + ["mangohud", '--dlsym']
+    return command + args.command
+
+
+def sigterm_handler(signum, *_):
+    """ Ignore sigterm """
+    print(f'Received signal {signum}')
+    if signum == 15:
+        tree = get_tree(os.getpid())
+        print(f'pygame pid: {os.getpid()}')
+        print(f'process tree: {tree}')
+        cleanup(tree)
+
+
+def main() -> None:
+    """ Main function """
+    signal.signal(signal.SIGTERM, sigterm_handler)
+    signal.signal(signal.SIGINT, sigterm_handler)
+    args = args_setup()
+
+    steam = 'steam' in ''.join(args.command).lower()
+
+    # Load config
+    default = {
+        'config': {'prime': '1002:73bf', 'width': '2560', 'height': '1440'},
+        'env': {'SDL_VIDEODRIVER': 'x11'}
+    }
+    config = get_json_dict(
+        os.path.expanduser('~/.config/pygame.json'), default)
+    try:
+        if config['config']['prime']:
+            config['env']['DRI_PRIME'] = \
+                get_device_path(config['config']['prime'])
+    except (ValueError, KeyError):
+        pass
+
+    if args.mangohud and not args.opengl:
+        config['env']['MANGOHUD'] = '1'
+
+    if args.x11:
+        config['env']['SDL_VIDEODRIVER'] = "x11"
+
+    command = generate_command(args, steam, config['config']['width'],
+                               config['config']['height'])
+
+    # Run command and log output to file
+    logpath = os.path.expanduser('~/.cache/pygame.log')
+    with open(logpath, 'w', encoding='utf-8') as logfile:
+        with Popen(
+            command, env=get_env(config['env']),
+            stdout=logfile, stderr=logfile
+        ) as proc:
+            print('Running command:', *proc.args)
+            print(f'Logging command output to {logpath}')
+            # Update process tree
+            time.sleep(5)
+            tree = get_tree(os.getpid())
+            while proc.poll() is None:
+                time.sleep(1)
+                tree = get_tree(os.getpid())
+
+    if steam:
+        kill_siblings('wine', 'pressure-vessel')
+
+    print(f'pygame pid: {os.getpid()}')
+    print(f'process tree: {tree}')
+    cleanup(tree)
+
+
+if __name__ == "__main__":
+    main()
