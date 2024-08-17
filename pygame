@@ -41,6 +41,9 @@ def args_setup():
         '-x', '--x11', action='store_true',
         help='Force gamescope to run in x11 mode')
     parser.add_argument(
+        '-l', '--log', action='store_true',
+        help='Save process output to logfile at ~/.cache/pygame.log')
+    parser.add_argument(
         '-o', '--opengl', action='store_true',
         help='Specify that game uses OpenGL for mangohud')
     parser.add_argument(
@@ -86,7 +89,10 @@ def get_json_dict(path, default) -> dict:
     """ Get dict from json file """
     try:
         with open(path, 'r', encoding='utf-8') as file:
-            output = json.load(file, parse_int=str, parse_float=str)
+            output = file.read()
+            output = re.sub(re.compile(r"/\*.*?\*/", re.DOTALL), "", output)
+            output = re.sub(re.compile(r"//.*?\n"), "", output)
+            return json.loads(output, parse_int=str, parse_float=str)
     except FileNotFoundError:
         with open(path, 'w', encoding='utf-8') as file:
             file.write(json.dumps(default, indent=4))
@@ -174,15 +180,15 @@ def cleanup(tree) -> None:
     kill(tree, 'SIGKILL')
 
 
-def generate_command(args, steam, config_width, config_height):
+def generate_command(args, steam, config):
     """ Generate main command to run """
     # Create command
     command = []
     if args.prime:
         command = command + ["prime-run"]
     if args.gamescope:
-        width = args.width or config_width
-        height = args.height or config_height
+        width = args.width or config["width"]
+        height = args.height or config["height"]
         if command_exists('gamescope'):
             gamescope = [
                 "gamescope",
@@ -231,33 +237,45 @@ def main() -> None:
         'config': {'prime': '1002:73bf', 'width': '2560', 'height': '1440'},
         'env': {'SDL_VIDEODRIVER': 'x11'}
     }
-    config = get_json_dict(
+
+    config_full = get_json_dict(
         os.path.expanduser('~/.config/pygame.json'), default)
+    config = config_full['config']
+    env = config_full['env']
+
     try:
-        if config['config']['prime']:
-            config['env']['DRI_PRIME'] = \
-                get_device_path(config['config']['prime'])
+        if config['prime']:
+            env['DRI_PRIME'] = \
+                get_device_path(config['prime'])
     except (ValueError, KeyError):
         pass
 
     if args.mangohud and not args.opengl:
-        config['env']['MANGOHUD'] = '1'
+        env['MANGOHUD'] = '1'
 
     if args.x11:
-        config['env']['SDL_VIDEODRIVER'] = "x11"
+        env['SDL_VIDEODRIVER'] = "x11"
 
-    command = generate_command(args, steam, config['config']['width'],
-                               config['config']['height'])
+    command = generate_command(args, steam, config)
 
     # Run command and log output to file
-    logpath = os.path.expanduser('~/.cache/pygame.log')
-    with open(logpath, 'w', encoding='utf-8') as logfile:
-        with Popen(
-            command, env=get_env(config['env']),
-            stdout=logfile, stderr=logfile
-        ) as proc:
-            print('Running command:', *proc.args)
-            print(f'Logging command output to {logpath}')
+    if args.log:
+        logpath = os.path.expanduser('~/.cache/pygame.log')
+        with open(logpath, 'w', encoding='utf-8') as logfile:
+            with Popen(
+                command, env=get_env(env),
+                stdout=logfile, stderr=logfile
+            ) as proc:
+                print('Running command:', *proc.args)
+                print(f'Logging command output to {logpath}')
+                # Update process tree
+                time.sleep(5)
+                tree = get_tree(os.getpid())
+                while proc.poll() is None:
+                    time.sleep(1)
+                    tree = get_tree(os.getpid())
+    else:
+        with Popen(command, env=get_env(env)) as proc:
             # Update process tree
             time.sleep(5)
             tree = get_tree(os.getpid())
