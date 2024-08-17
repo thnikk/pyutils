@@ -187,8 +187,13 @@ def generate_command(args, steam, config):
     if args.prime:
         command = command + ["prime-run"]
     if args.gamescope:
-        width = args.width or config["width"]
-        height = args.height or config["height"]
+        try:
+            width = args.width or config["width"]
+            height = args.height or config["height"]
+        except KeyError:
+            print(
+                'Must specify width and height in arguments or configuration.')
+            sys.exit(1)
         if command_exists('gamescope'):
             gamescope = [
                 "gamescope",
@@ -202,7 +207,7 @@ def generate_command(args, steam, config):
                 gamescope.insert(-2, '-e')
             if args.cursor:
                 gamescope.insert(-2, '--force-grab-cursor')
-            if args.x11:
+            if args.x11 or ('x11' in config and config['x11']):
                 gamescope.insert(-2, '--backend=sdl')
             command = command + gamescope
     if args.gamemode:
@@ -259,7 +264,7 @@ def main() -> None:
     command = generate_command(args, steam, config)
 
     # Run command and log output to file
-    if args.log:
+    if args.log or ('log' in config and config['log']):
         logpath = os.path.expanduser('~/.cache/pygame.log')
         with open(logpath, 'w', encoding='utf-8') as logfile:
             with Popen(
