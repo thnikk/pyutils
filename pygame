@@ -13,6 +13,7 @@ import json
 import glob
 import re
 import time
+from datetime import datetime
 
 
 def args_setup():
@@ -156,10 +157,8 @@ def get_tree(pid) -> list:
         ['pstree', '-p', '-l', '-T', str(pid)],
         check=False, capture_output=True
     ).stdout.decode('utf-8')
-    tree = []
-    for line in output.splitlines():
-        tree = tree + re.findall(r'\(([^)]+)', line)
-    return list(reversed(tree[1:]))
+    tree = re.findall(r'\(([^)]+)', output)
+    return tree[1:]
 
 
 def kill(pid_list, sig="SIGTERM") -> None:
@@ -258,14 +257,14 @@ def main() -> None:
     if args.mangohud and not args.opengl:
         env['MANGOHUD'] = '1'
 
-    if args.x11:
+    if args.x11 or ('x11' in config and config['x11']):
         env['SDL_VIDEODRIVER'] = "x11"
 
     command = generate_command(args, steam, config)
 
+    logpath = os.path.expanduser('~/.cache/pygame.log')
     # Run command and log output to file
     if args.log or ('log' in config and config['log']):
-        logpath = os.path.expanduser('~/.cache/pygame.log')
         with open(logpath, 'w', encoding='utf-8') as logfile:
             with Popen(
                 command, env=get_env(env),
@@ -274,25 +273,27 @@ def main() -> None:
                 print('Running command:', *proc.args)
                 print(f'Logging command output to {logpath}')
                 # Update process tree
-                time.sleep(5)
+                time.sleep(10)
                 tree = get_tree(os.getpid())
-                while proc.poll() is None:
-                    time.sleep(1)
-                    tree = get_tree(os.getpid())
     else:
-        with Popen(command, env=get_env(env)) as proc:
+        with Popen(
+            command, env=get_env(env), stdout=DEVNULL, stderr=DEVNULL
+        ) as proc:
             # Update process tree
-            time.sleep(5)
+            time.sleep(10)
             tree = get_tree(os.getpid())
-            while proc.poll() is None:
-                time.sleep(1)
-                tree = get_tree(os.getpid())
+
+    with open(logpath, 'a', encoding='utf-8') as logfile:
+        print(
+            f'[{datetime.now().timestamp()}] pygame pid: {os.getpid()}',
+            file=logfile)
+        print(
+            f'[{datetime.now().timestamp()}] process tree: {tree}',
+            file=logfile)
 
     if steam:
         kill_siblings('wine', 'pressure-vessel')
 
-    print(f'pygame pid: {os.getpid()}')
-    print(f'process tree: {tree}')
     cleanup(tree)
 
 
