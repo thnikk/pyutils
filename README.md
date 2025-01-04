@@ -1,3 +1,7 @@
+# Dependencies
+
+`gamescope, mangohud, python-psutil`
+
 # Installation
 
 1) Clone the repo somewhere.
