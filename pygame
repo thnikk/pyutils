@@ -14,6 +14,8 @@ import glob
 import re
 import time
 from datetime import datetime
+import threading
+import psutil
 
 
 def args_setup():
@@ -28,13 +30,17 @@ def args_setup():
     )
     parser.add_argument(
         '-p', '--prime', action='store_true',
-        help='Enable PRIME offloading for NVIDIA gpus')
+        help='Disable prime if configured')
     parser.add_argument(
         '-g', '--gamescope', action='store_true', help='Enable gamescope')
     parser.add_argument(
         '-m', '--mangohud', action='store_true', help='Enable mangohud')
     parser.add_argument(
+        '-a', '--mangoapp', action='store_true', help='Enable mangoapp')
+    parser.add_argument(
         '-M', '--gamemode', action='store_true', help='Enable gamemode')
+    parser.add_argument(
+        '-r', action='store_true', help='Disable reaper')
     parser.add_argument(
         '-c', '--cursor', action='store_true',
         help='Force grab cursor in gamescope')
@@ -120,71 +126,35 @@ def get_device_path(vid_pid) -> str:
     raise ValueError('vid:pid not found.')
 
 
-def kill_siblings(process_name, parent_name) -> None:
-    """ Kill sibling processes """
-    print('Killing game process siblings.')
-
-    def get_output(command) -> list:
-        """ Get line split output of a command """
-        try:
-            output = run(
-                command, check=True, capture_output=True
-            ).stdout.decode('utf-8').strip().splitlines()
-            return output
-        except CalledProcessError:
-            return []
-
-    def get_command(pid) -> str:
-        """ Get full command for pid """
-        return get_output(['ps', '-p', pid, '-o', 'args', '--no-headers'])[0]
-
-    for line in get_output(['pgrep', process_name]):
-        try:
-            parents = get_output(['ps', '-o', 'ppid=', '-p', line])
-            for parent in parents:
-                if parent_name in get_command(parent):
-                    children = get_output(['pgrep', '-P', parent.strip()])
-                    for child in children:
-                        print('Killing', child)
-                        get_output(['kill', '-SIGKILL', child])
-        except CalledProcessError as e:
-            print(e.output)
-
-
 def get_tree(pid) -> list:
     """ Get process tree of given PID """
-    output = run(
-        ['pstree', '-p', '-l', '-T', str(pid)],
-        check=False, capture_output=True
-    ).stdout.decode('utf-8')
-    tree = re.findall(r'\(([^)]+)', output)
-    return tree[1:]
+    parent = psutil.Process(pid)
+    return parent.children(recursive=True)
 
 
-def kill(pid_list, sig="SIGTERM") -> None:
+def kill(processes, sig="SIGTERM") -> None:
     """ Kill process list with signal """
-    for pid in pid_list:
+    for process in processes:
+        # Don't kill main process first
+        if process.name == 'pygame':
+            continue
         try:
-            run(['kill', f'-{sig}', pid], check=True, capture_output=False,
+            print(f'Sending {sig} to {process.name()} [{process.pid}]',
+                  file=sys.stderr)
+            run(['kill', f'-{sig}', f'{process.pid}'],
+                check=True, capture_output=False,
                 stdout=DEVNULL, stderr=STDOUT)
-            print(f'Sending {sig} to {pid}')
-        except (CalledProcessError, ValueError):
+        except (CalledProcessError, ValueError, psutil.NoSuchProcess):
+            # print(f"Couldn't kill {pid}.")
             pass
-
-
-def cleanup(tree) -> None:
-    """ Kill leftover processes after game is closed """
-    kill(tree, 'SIGTERM')
-    time.sleep(3)
-    kill(tree, 'SIGKILL')
 
 
 def generate_command(args, steam, config):
     """ Generate main command to run """
     # Create command
     command = []
-    if args.prime:
-        command = command + ["prime-run"]
+    # if 'prime' in config and config['prime']:
+    #     prime = ['env', f"DRI_PRIME={get_device_path(config['prime'])}"]
     if args.gamescope:
         try:
             width = args.width or config["width"]
@@ -200,19 +170,31 @@ def generate_command(args, steam, config):
                 "-W", width,
                 "-h", height,
                 "-H", height,
+                "--filter", "fsr",
+                "--fsr-sharpness", "0",
+                "--rt",
                 "-f", "--"
             ]
             if steam:
                 gamescope.insert(-2, '-e')
-            if args.cursor:
+            if args.cursor or ('cursor' in config and config['cursor']):
                 gamescope.insert(-2, '--force-grab-cursor')
+                gamescope.insert(-2, '--mouse-sensitivity=1.25')
             if args.x11 or ('x11' in config and config['x11']):
                 gamescope.insert(-2, '--backend=sdl')
+            if ('mangoapp' in config and config['mangoapp']) or args.mangoapp:
+                gamescope.insert(-2, '--mangoapp')
             command = command + gamescope
+
+    # if prime and not args.prime:
+    #     command = command + prime
+
     if args.gamemode:
         if command_exists('gamemoderun'):
             command = command + ["gamemoderun"]
-    if args.mangohud and args.opengl:
+    if args.mangohud and args.opengl and not (
+        'mangoapp' in config and config['mangoapp']
+    ):
         if command_exists('mangohud'):
             command = command + ["mangohud", '--dlsym']
     return command + args.command
@@ -225,7 +207,37 @@ def sigterm_handler(signum, *_):
         tree = get_tree(os.getpid())
         print(f'pygame pid: {os.getpid()}')
         print(f'process tree: {tree}')
-        cleanup(tree)
+        # cleanup(tree)
+        kill(tree, 'SIGKILL')
+
+
+def reaper(pid):
+    time.sleep(1)
+    print('Reaper thread started.')
+    tree = get_tree(pid)
+    last_tree = tree
+    while True:
+        tree = get_tree(pid)
+        # Filter out gamescope and mangoapp
+        stripped = []
+        for item in last_tree:
+            try:
+                name = item.name()
+            except psutil.NoSuchProcess:
+                continue
+            if 'gamescope' not in name and 'mangoapp' not in name:
+                stripped.append(item)
+        try:
+            # Raise error if game process isn't in the tree
+            if stripped[0] not in tree:
+                raise ValueError
+        except (IndexError, ValueError):
+            print('Reaper thread killing tree.')
+            # print("Killing:", last_tree)
+            kill(last_tree, "SIGKILL")
+            return
+        last_tree = tree
+        time.sleep(1)
 
 
 def main() -> None:
@@ -233,6 +245,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, sigterm_handler)
     signal.signal(signal.SIGINT, sigterm_handler)
     args = args_setup()
+
+    if not args.r:
+        reaper_thread = threading.Thread(target=reaper, args=[os.getpid()])
+        reaper_thread.start()
 
     steam = 'steam' in ''.join(args.command).lower()
 
@@ -246,20 +262,30 @@ def main() -> None:
         os.path.expanduser('~/.config/pygame.json'), default)
     config = config_full['config']
     env = config_full['env']
+    env['WINEDEBUG'] = '-all'
 
+    # Enable PRIME offloading
     try:
-        if config['prime']:
+        if config['prime'] and not args.prime:
             env['DRI_PRIME'] = \
                 get_device_path(config['prime'])
+        else:
+            print('Prime disabled.')
+            env['DRI_PRIME'] = "0"
     except (ValueError, KeyError):
         pass
 
-    if args.mangohud and not args.opengl:
+    # Enable mangohud/mangoapp
+    if args.mangohud and not args.opengl and (
+        'mangoapp' not in config or not config['mangoapp']
+    ):
         env['MANGOHUD'] = '1'
 
+    # Set SDL backend for gamescope if x11 is set to true
     if args.x11 or ('x11' in config and config['x11']):
         env['SDL_VIDEODRIVER'] = "x11"
 
+    # Generate full command to run
     command = generate_command(args, steam, config)
 
     logpath = os.path.expanduser('~/.cache/pygame.log')
@@ -290,11 +316,6 @@ def main() -> None:
         print(
             f'[{datetime.now().timestamp()}] process tree: {tree}',
             file=logfile)
-
-    if steam:
-        kill_siblings('wine', 'pressure-vessel')
-
-    cleanup(tree)
 
 
 if __name__ == "__main__":
